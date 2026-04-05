@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import csv
+import os
 import time
 import threading
 from dataclasses import dataclass
@@ -37,6 +39,10 @@ READ_CHUNK_SIZE = 4096
 
 # Nếu muốn chỉ publish khi cả 2 đều RTK FIX thì bật True
 PUBLISH_ONLY_WHEN_BOTH_RTK_FIX = False
+
+# Log RTK FIX ra CSV
+CSV_FRONT_PATH = "gps_front_path.csv"
+CSV_BASE_PATH = "gps_base_path.csv"   # ghi dữ liệu từ rover rear vào file base
 
 
 # =========================================================
@@ -208,6 +214,9 @@ class DualGpsHeadingNode(Node):
 
         self.last_stats_time = time.time()
 
+        self.csv_lock = threading.Lock()
+        self.init_csv_files()
+
         # threads
         self.threads = [
             threading.Thread(target=self.rtcm_broadcast_thread, daemon=True),
@@ -223,6 +232,59 @@ class DualGpsHeadingNode(Node):
         self.get_logger().info(f"RTCM input: {COM_RTCM_IN}")
         self.get_logger().info(f"Front rover: {COM_FRONT_ROVER} -> {TOPIC_FRONT}")
         self.get_logger().info(f"Rear rover : {COM_REAR_ROVER} -> {TOPIC_REAR}")
+        self.get_logger().info(f"RTK FIX CSV front: {CSV_FRONT_PATH}")
+        self.get_logger().info(f"RTK FIX CSV base : {CSV_BASE_PATH}")
+
+    def init_csv_files(self):
+        self.ensure_csv_header(CSV_FRONT_PATH)
+        self.ensure_csv_header(CSV_BASE_PATH)
+
+    def ensure_csv_header(self, file_path: str):
+        write_header = (not os.path.exists(file_path)) or os.path.getsize(file_path) == 0
+        if not write_header:
+            return
+
+        with self.csv_lock:
+            with open(file_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "pc_time_unix",
+                    "ros_stamp_sec",
+                    "ros_stamp_nanosec",
+                    "source",
+                    "utc_key",
+                    "latitude",
+                    "longitude",
+                    "altitude",
+                    "sats",
+                    "hdop",
+                    "fix_quality",
+                    "fix_text",
+                    "raw_nmea",
+                ])
+
+    def append_rtk_fix_csv(self, file_path: str, gga: GgaFrame, stamp):
+        if gga.fix_quality != 4:
+            return
+
+        with self.csv_lock:
+            with open(file_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    f"{time.time():.6f}",
+                    int(getattr(stamp, "sec", 0)),
+                    int(getattr(stamp, "nanosec", 0)),
+                    gga.source,
+                    gga.utc_key,
+                    f"{gga.lat:.9f}",
+                    f"{gga.lon:.9f}",
+                    f"{gga.alt:.4f}",
+                    gga.sats,
+                    f"{gga.hdop:.3f}",
+                    gga.fix_quality,
+                    gga.fix_text,
+                    gga.raw_nmea,
+                ])
 
     # -----------------------------------------------------
     # RTCM INPUT
@@ -456,6 +518,9 @@ class DualGpsHeadingNode(Node):
 
                 self.front_pub.publish(front_msg)
                 self.rear_pub.publish(rear_msg)
+
+                self.append_rtk_fix_csv(CSV_FRONT_PATH, front_gga, stamp)
+                self.append_rtk_fix_csv(CSV_BASE_PATH, rear_gga, stamp)
 
                 delta_ms = abs(front_gga.rx_pc_time - rear_gga.rx_pc_time) * 1000.0
                 self.get_logger().info(
